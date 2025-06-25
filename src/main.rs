@@ -43,6 +43,8 @@ struct OutputData {
 struct InstructionInfo {
     offset: u32,
     instruction: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -139,6 +141,7 @@ fn main() {
                             .unwrap_or_else(|_| vec![InstructionInfo {
                                 offset: 0,
                                 instruction: "Failed to disassemble".to_string(),
+                                target: None,
                             }]);
                         
                         let function_info = FunctionInfo {
@@ -227,6 +230,7 @@ trait InstructionDecoding: Arch {
     type InstructionDisplay<'a>: std::fmt::Display;
     fn make_decoder() -> Self::Decoder;
     fn inst_display(inst: &Self::Instruction, base_address: u64, code_size: usize, offset: u32, function_addresses: &HashMap<u64, String>) -> String;
+    fn get_jump_target(inst: &Self::Instruction, base_address: u64, code_size: usize, offset: u32) -> Option<u32>;
 }
 
 impl InstructionDecoding for yaxpeax_x86::amd64::Arch {
@@ -317,6 +321,77 @@ impl InstructionDecoding for yaxpeax_x86::amd64::Arch {
             inst.display_with(yaxpeax_x86::amd64::DisplayStyle::Intel).to_string()
         }
     }
+
+    fn get_jump_target(inst: &Self::Instruction, base_address: u64, code_size: usize, offset: u32) -> Option<u32> {
+        fn is_relative_branch(opcode: Opcode) -> bool {
+            matches!(
+                opcode,
+                Opcode::JMP
+                    | Opcode::JRCXZ
+                    | Opcode::LOOP
+                    | Opcode::LOOPZ
+                    | Opcode::LOOPNZ
+                    | Opcode::JO
+                    | Opcode::JNO
+                    | Opcode::JB
+                    | Opcode::JNB
+                    | Opcode::JZ
+                    | Opcode::JNZ
+                    | Opcode::JNA
+                    | Opcode::JA
+                    | Opcode::JS
+                    | Opcode::JNS
+                    | Opcode::JP
+                    | Opcode::JNP
+                    | Opcode::JL
+                    | Opcode::JGE
+                    | Opcode::JLE
+                    | Opcode::JG
+            )
+        }
+
+        fn is_relative_call(opcode: Opcode) -> bool {
+            matches!(opcode, Opcode::CALL)
+        }
+
+        if is_relative_branch(inst.opcode()) || is_relative_call(inst.opcode()) {
+            match inst.operand(0) {
+                Operand::ImmediateI8 { imm } => {
+                    let dest = base_address as i64
+                        + offset as i64
+                        + inst.len().to_const() as i64
+                        + imm as i64;
+                    let dest_addr = dest as u64;
+                    
+                    // Check if destination is within the current code region (local jump)
+                    if dest_addr >= base_address && dest_addr < base_address + code_size as u64 {
+                        let relative_offset = dest_addr - base_address;
+                        Some(relative_offset as u32)
+                    } else {
+                        None // External jump
+                    }
+                }
+                Operand::ImmediateI32 { imm } => {
+                    let dest = base_address as i64
+                        + offset as i64
+                        + inst.len().to_const() as i64
+                        + imm as i64;
+                    let dest_addr = dest as u64;
+                    
+                    // Check if destination is within the current code region (local jump)
+                    if dest_addr >= base_address && dest_addr < base_address + code_size as u64 {
+                        let relative_offset = dest_addr - base_address;
+                        Some(relative_offset as u32)
+                    } else {
+                        None // External jump
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None // Not a jump/call instruction
+        }
+    }
 }
 
 impl InstructionDecoding for yaxpeax_x86::protected_mode::Arch {
@@ -330,6 +405,11 @@ impl InstructionDecoding for yaxpeax_x86::protected_mode::Arch {
     fn inst_display(inst: &Self::Instruction, _base_address: u64, _code_size: usize, _offset: u32, _function_addresses: &HashMap<u64, String>) -> String {
         inst.to_string()
     }
+
+    fn get_jump_target(_inst: &Self::Instruction, _base_address: u64, _code_size: usize, _offset: u32) -> Option<u32> {
+        // Implementation of get_jump_target method
+        None
+    }
 }
 
 impl InstructionDecoding for yaxpeax_arm::armv8::a64::ARMv8 {
@@ -342,6 +422,11 @@ impl InstructionDecoding for yaxpeax_arm::armv8::a64::ARMv8 {
 
     fn inst_display(inst: &Self::Instruction, _base_address: u64, _code_size: usize, _offset: u32, _function_addresses: &HashMap<u64, String>) -> String {
         inst.to_string()
+    }
+
+    fn get_jump_target(_inst: &Self::Instruction, _base_address: u64, _code_size: usize, _offset: u32) -> Option<u32> {
+        // Implementation of get_jump_target method
+        None
     }
 }
 
@@ -357,6 +442,11 @@ impl InstructionDecoding for yaxpeax_arm::armv7::ARMv7 {
 
     fn inst_display(inst: &Self::Instruction, _base_address: u64, _code_size: usize, _offset: u32, _function_addresses: &HashMap<u64, String>) -> String {
         inst.to_string()
+    }
+
+    fn get_jump_target(_inst: &Self::Instruction, _base_address: u64, _code_size: usize, _offset: u32) -> Option<u32> {
+        // Implementation of get_jump_target method
+        None
     }
 }
 
@@ -375,9 +465,11 @@ where
         let before = u64::from(reader.total_offset()) as u32;
         match decoder.decode(&mut reader) {
             Ok(inst) => {
+                let target = A::get_jump_target(&inst, base_address, code_size, offset);
                 instructions.push(InstructionInfo {
                     offset,
                     instruction: A::inst_display(&inst, base_address, code_size, offset, function_addresses),
+                    target,
                 });
                 let after = u64::from(reader.total_offset()) as u32;
                 offset += after - before;
@@ -407,6 +499,7 @@ where
                         ".byte {s:width$} # Invalid instruction {s2}: {e}",
                         width = A::ADJUST_BY_AFTER_ERROR * 6
                     ),
+                    target: None,
                 });
 
                 offset += A::ADJUST_BY_AFTER_ERROR as u32;
