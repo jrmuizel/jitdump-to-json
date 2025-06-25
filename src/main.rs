@@ -1,7 +1,8 @@
 use linux_perf_data::jitdump::{JitDumpReader, JitDumpRecord};
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::HashMap;
-use yaxpeax_arch::{Arch, DecodeError, Reader, U8Reader};
+use yaxpeax_arch::{Arch, DecodeError, LengthedInstruction, Reader, U8Reader};
+use yaxpeax_x86::amd64::{Opcode, Operand};
 
 fn serialize_address_as_hex<S>(addr: &u64, serializer: S) -> Result<S::Ok, S::Error>
 where
@@ -61,14 +62,17 @@ struct FunctionInfo {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} <function_name> [jitdump_file]", args[0]);
+        eprintln!("Usage: {} [function_name] [jitdump_file]", "jitdump-to-json");
         std::process::exit(1);
     }
     
-    let target_function = &args[1];
-    let jitdump_file = args.get(2)
-        .map(|s| s.as_str())
-        .unwrap_or("/Users/mstange/Downloads/jit-34147.dump");
+    let target_function = if args.len() >= 3 { 
+        Some(&args[1]) 
+    } else { 
+        None 
+    };
+    let jitdump_file = (args.get(if target_function.is_some() { 2 } else { 1 })).map(|s| s.as_str())
+        .unwrap();
 
     let file = std::fs::File::open(jitdump_file)
         .unwrap_or_else(|e| {
@@ -83,6 +87,7 @@ fn main() {
     let mut debug_info_map: HashMap<u64, Vec<DebugEntry>> = HashMap::new();
     let mut functions: Vec<FunctionInfo> = Vec::new();
     let mut source_files: HashMap<String, Option<String>> = HashMap::new();
+    let mut all_function_names: Vec<String> = Vec::new();
 
     while let Ok(Some(record)) = reader.next_record() {
         let timestamp = record.timestamp;
@@ -113,32 +118,37 @@ fn main() {
             JitDumpRecord::CodeLoad(load_record) => {
                 let function_name = String::from_utf8_lossy(&load_record.function_name.as_slice()).to_string();
                 
-                // Check if this function matches our target
-                if function_name.contains(target_function) {
-                    let debug_entries = debug_info_map
-                        .get(&load_record.code_addr)
-                        .cloned()
-                        .unwrap_or_default();
-                    
-                    let disassembly = disassemble_code(&load_record.code_bytes.as_slice(), em_arch)
-                        .unwrap_or_else(|_| vec![InstructionInfo {
-                            offset: 0,
-                            instruction: "Failed to disassemble".to_string(),
-                        }]);
-                    
-                    let function_info = FunctionInfo {
-                        name: function_name,
-                        code_index: load_record.code_index,
-                        pid: load_record.pid,
-                        tid: load_record.tid,
-                        address: load_record.code_addr,
-                        size: load_record.code_bytes.len(),
-                        timestamp,
-                        debug_info: debug_entries,
-                        disassembly,
-                    };
-                    
-                    functions.push(function_info);
+                // If no target function specified, collect all function names
+                if target_function.is_none() {
+                    all_function_names.push(function_name);
+                } else {
+                    // Check if this function matches our target
+                    if function_name.contains(target_function.unwrap()) {
+                        let debug_entries = debug_info_map
+                            .get(&load_record.code_addr)
+                            .cloned()
+                            .unwrap_or_default();
+                        
+                        let disassembly = disassemble_code(&load_record.code_bytes.as_slice(), em_arch, load_record.code_addr)
+                            .unwrap_or_else(|_| vec![InstructionInfo {
+                                offset: 0,
+                                instruction: "Failed to disassemble".to_string(),
+                            }]);
+                        
+                        let function_info = FunctionInfo {
+                            name: function_name,
+                            code_index: load_record.code_index,
+                            pid: load_record.pid,
+                            tid: load_record.tid,
+                            address: load_record.code_addr,
+                            size: load_record.code_bytes.len(),
+                            timestamp,
+                            debug_info: debug_entries,
+                            disassembly,
+                        };
+                        
+                        functions.push(function_info);
+                    }
                 }
             }
             _ => {
@@ -147,8 +157,16 @@ fn main() {
         }
     }
 
+    // If no target function was specified, just list all function names
+    if target_function.is_none() {
+        for function_name in all_function_names {
+            println!("{}", function_name);
+        }
+        return;
+    }
+
     if functions.is_empty() {
-        eprintln!("No functions found matching '{}'", target_function);
+        eprintln!("No functions found matching '{}'", target_function.unwrap());
         std::process::exit(1);
     }
 
@@ -183,12 +201,12 @@ const EM_386: u16 = 3;
 /// AMD x86-64 architecture
 const EM_X86_64: u16 = 62;
 
-fn disassemble_code(bytes: &[u8], elf_machine_arch: u16) -> Result<Vec<InstructionInfo>, String> {
+fn disassemble_code(bytes: &[u8], elf_machine_arch: u16, base_address: u64) -> Result<Vec<InstructionInfo>, String> {
     match elf_machine_arch {
-        EM_386 => disassemble::<yaxpeax_x86::protected_mode::Arch>(bytes),
-        EM_X86_64 => disassemble::<yaxpeax_x86::amd64::Arch>(bytes),
-        EM_AARCH64 => disassemble::<yaxpeax_arm::armv8::a64::ARMv8>(bytes),
-        EM_ARM => disassemble::<yaxpeax_arm::armv7::ARMv7>(bytes),
+        EM_386 => disassemble::<yaxpeax_x86::protected_mode::Arch>(bytes, base_address),
+        EM_X86_64 => disassemble::<yaxpeax_x86::amd64::Arch>(bytes, base_address),
+        EM_AARCH64 => disassemble::<yaxpeax_arm::armv8::a64::ARMv8>(bytes, base_address),
+        EM_ARM => disassemble::<yaxpeax_arm::armv7::ARMv7>(bytes, base_address),
         _ => {
             Err(format!(
                 "Unrecognized ELF machine architecture {elf_machine_arch}"
@@ -201,7 +219,7 @@ trait InstructionDecoding: Arch {
     const ADJUST_BY_AFTER_ERROR: usize;
     type InstructionDisplay<'a>: std::fmt::Display;
     fn make_decoder() -> Self::Decoder;
-    fn inst_display(inst: &Self::Instruction) -> Self::InstructionDisplay<'_>;
+    fn inst_display(inst: &Self::Instruction, base_address: u64, offset: u32) -> String;
 }
 
 impl InstructionDecoding for yaxpeax_x86::amd64::Arch {
@@ -212,8 +230,59 @@ impl InstructionDecoding for yaxpeax_x86::amd64::Arch {
         yaxpeax_x86::amd64::InstDecoder::default()
     }
 
-    fn inst_display(inst: &Self::Instruction) -> Self::InstructionDisplay<'_> {
-        inst.display_with(yaxpeax_x86::amd64::DisplayStyle::Intel)
+    fn inst_display(inst: &Self::Instruction, base_address: u64, offset: u32) -> String {
+        fn is_relative_branch(opcode: Opcode) -> bool {
+            matches!(
+                opcode,
+                Opcode::JMP
+                    | Opcode::JRCXZ
+                    | Opcode::LOOP
+                    | Opcode::LOOPZ
+                    | Opcode::LOOPNZ
+                    | Opcode::JO
+                    | Opcode::JNO
+                    | Opcode::JB
+                    | Opcode::JNB
+                    | Opcode::JZ
+                    | Opcode::JNZ
+                    | Opcode::JNA
+                    | Opcode::JA
+                    | Opcode::JS
+                    | Opcode::JNS
+                    | Opcode::JP
+                    | Opcode::JNP
+                    | Opcode::JL
+                    | Opcode::JGE
+                    | Opcode::JLE
+                    | Opcode::JG
+            )
+        }
+
+        fn is_relative_call(opcode: Opcode) -> bool {
+            matches!(opcode, Opcode::CALL)
+        }
+
+        if is_relative_branch(inst.opcode()) || is_relative_call(inst.opcode()) {
+            match inst.operand(0) {
+                Operand::ImmediateI8 { imm } => {
+                    let dest = base_address as i64
+                        + offset as i64
+                        + inst.len().to_const() as i64
+                        + imm as i64;
+                    format!("{} 0x{:x}", inst.opcode(), dest)
+                }
+                Operand::ImmediateI32 { imm } => {
+                    let dest = base_address as i64
+                        + offset as i64
+                        + inst.len().to_const() as i64
+                        + imm as i64;
+                    format!("{} 0x{:x}", inst.opcode(), dest)
+                }
+                _ => inst.display_with(yaxpeax_x86::amd64::DisplayStyle::Intel).to_string(),
+            }
+        } else {
+            inst.display_with(yaxpeax_x86::amd64::DisplayStyle::Intel).to_string()
+        }
     }
 }
 
@@ -225,8 +294,8 @@ impl InstructionDecoding for yaxpeax_x86::protected_mode::Arch {
         yaxpeax_x86::protected_mode::InstDecoder::default()
     }
 
-    fn inst_display(inst: &Self::Instruction) -> Self::InstructionDisplay<'_> {
-        inst
+    fn inst_display(inst: &Self::Instruction, _base_address: u64, _offset: u32) -> String {
+        inst.to_string()
     }
 }
 
@@ -238,8 +307,8 @@ impl InstructionDecoding for yaxpeax_arm::armv8::a64::ARMv8 {
         yaxpeax_arm::armv8::a64::InstDecoder::default()
     }
 
-    fn inst_display(inst: &Self::Instruction) -> Self::InstructionDisplay<'_> {
-        inst
+    fn inst_display(inst: &Self::Instruction, _base_address: u64, _offset: u32) -> String {
+        inst.to_string()
     }
 }
 
@@ -253,12 +322,12 @@ impl InstructionDecoding for yaxpeax_arm::armv7::ARMv7 {
         yaxpeax_arm::armv7::InstDecoder::default_thumb()
     }
 
-    fn inst_display(inst: &Self::Instruction) -> Self::InstructionDisplay<'_> {
-        inst
+    fn inst_display(inst: &Self::Instruction, _base_address: u64, _offset: u32) -> String {
+        inst.to_string()
     }
 }
 
-fn disassemble<'a, A: InstructionDecoding>(bytes: &'a [u8]) -> Result<Vec<InstructionInfo>, String>
+fn disassemble<'a, A: InstructionDecoding>(bytes: &'a [u8], base_address: u64) -> Result<Vec<InstructionInfo>, String>
 where
     u64: From<A::Address>,
     U8Reader<'a>: yaxpeax_arch::Reader<A::Address, A::Word>,
@@ -275,7 +344,7 @@ where
             Ok(inst) => {
                 instructions.push(InstructionInfo {
                     offset,
-                    instruction: format!("{}", A::inst_display(&inst)),
+                    instruction: A::inst_display(&inst, base_address, offset),
                 });
                 let after = u64::from(reader.total_offset()) as u32;
                 offset += after - before;
