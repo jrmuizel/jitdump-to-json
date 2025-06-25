@@ -57,7 +57,7 @@ struct FunctionInfo {
     address: u64,
     size: usize,
     timestamp: u64,
-    debug_info: Vec<DebugEntry>,
+    debug_info: Vec<Vec<DebugEntry>>,
     disassembly: Vec<InstructionInfo>,
 }
 
@@ -85,8 +85,8 @@ fn main() {
     let mut reader = JitDumpReader::new(file).unwrap();
     let em_arch = reader.header().elf_machine_arch as u16;
     
-    // Store debug info by code address
-    let mut debug_info_map: HashMap<u64, Vec<DebugEntry>> = HashMap::new();
+    // Store debug info by code address (multiple sets per address)
+    let mut debug_info_map: HashMap<u64, Vec<Vec<DebugEntry>>> = HashMap::new();
     let mut functions: Vec<FunctionInfo> = Vec::new();
     let mut source_files: HashMap<String, Option<String>> = HashMap::new();
     let mut all_function_names: Vec<String> = Vec::new();
@@ -118,7 +118,9 @@ fn main() {
                     })
                     .collect();
                 
-                debug_info_map.insert(debug_record.code_addr, debug_entries);
+                debug_info_map.entry(debug_record.code_addr)
+                    .or_insert_with(Vec::new)
+                    .push(debug_entries);
             }
             JitDumpRecord::CodeLoad(load_record) => {
                 let function_name = String::from_utf8_lossy(&load_record.function_name.as_slice()).to_string();
