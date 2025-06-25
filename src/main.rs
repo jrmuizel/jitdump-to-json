@@ -88,6 +88,9 @@ fn main() {
     let mut functions: Vec<FunctionInfo> = Vec::new();
     let mut source_files: HashMap<String, Option<String>> = HashMap::new();
     let mut all_function_names: Vec<String> = Vec::new();
+    
+    // Track all function addresses and names for call resolution
+    let mut function_addresses: HashMap<u64, String> = HashMap::new();
 
     while let Ok(Some(record)) = reader.next_record() {
         let timestamp = record.timestamp;
@@ -118,6 +121,9 @@ fn main() {
             JitDumpRecord::CodeLoad(load_record) => {
                 let function_name = String::from_utf8_lossy(&load_record.function_name.as_slice()).to_string();
                 
+                // Always track function addresses and names for call resolution
+                function_addresses.insert(load_record.code_addr, function_name.clone());
+                
                 // If no target function specified, collect all function names
                 if target_function.is_none() {
                     all_function_names.push(function_name);
@@ -129,7 +135,7 @@ fn main() {
                             .cloned()
                             .unwrap_or_default();
                         
-                        let disassembly = disassemble_code(&load_record.code_bytes.as_slice(), em_arch, load_record.code_addr)
+                        let disassembly = disassemble_code(&load_record.code_bytes.as_slice(), em_arch, load_record.code_addr, &function_addresses)
                             .unwrap_or_else(|_| vec![InstructionInfo {
                                 offset: 0,
                                 instruction: "Failed to disassemble".to_string(),
@@ -201,12 +207,12 @@ const EM_386: u16 = 3;
 /// AMD x86-64 architecture
 const EM_X86_64: u16 = 62;
 
-fn disassemble_code(bytes: &[u8], elf_machine_arch: u16, base_address: u64) -> Result<Vec<InstructionInfo>, String> {
+fn disassemble_code(bytes: &[u8], elf_machine_arch: u16, base_address: u64, function_addresses: &HashMap<u64, String>) -> Result<Vec<InstructionInfo>, String> {
     match elf_machine_arch {
-        EM_386 => disassemble::<yaxpeax_x86::protected_mode::Arch>(bytes, base_address),
-        EM_X86_64 => disassemble::<yaxpeax_x86::amd64::Arch>(bytes, base_address),
-        EM_AARCH64 => disassemble::<yaxpeax_arm::armv8::a64::ARMv8>(bytes, base_address),
-        EM_ARM => disassemble::<yaxpeax_arm::armv7::ARMv7>(bytes, base_address),
+        EM_386 => disassemble::<yaxpeax_x86::protected_mode::Arch>(bytes, base_address, function_addresses),
+        EM_X86_64 => disassemble::<yaxpeax_x86::amd64::Arch>(bytes, base_address, function_addresses),
+        EM_AARCH64 => disassemble::<yaxpeax_arm::armv8::a64::ARMv8>(bytes, base_address, function_addresses),
+        EM_ARM => disassemble::<yaxpeax_arm::armv7::ARMv7>(bytes, base_address, function_addresses),
         _ => {
             Err(format!(
                 "Unrecognized ELF machine architecture {elf_machine_arch}"
@@ -219,7 +225,7 @@ trait InstructionDecoding: Arch {
     const ADJUST_BY_AFTER_ERROR: usize;
     type InstructionDisplay<'a>: std::fmt::Display;
     fn make_decoder() -> Self::Decoder;
-    fn inst_display(inst: &Self::Instruction, base_address: u64, offset: u32) -> String;
+    fn inst_display(inst: &Self::Instruction, base_address: u64, offset: u32, function_addresses: &HashMap<u64, String>) -> String;
 }
 
 impl InstructionDecoding for yaxpeax_x86::amd64::Arch {
@@ -230,7 +236,7 @@ impl InstructionDecoding for yaxpeax_x86::amd64::Arch {
         yaxpeax_x86::amd64::InstDecoder::default()
     }
 
-    fn inst_display(inst: &Self::Instruction, base_address: u64, offset: u32) -> String {
+    fn inst_display(inst: &Self::Instruction, base_address: u64, offset: u32, function_addresses: &HashMap<u64, String>) -> String {
         fn is_relative_branch(opcode: Opcode) -> bool {
             matches!(
                 opcode,
@@ -269,14 +275,28 @@ impl InstructionDecoding for yaxpeax_x86::amd64::Arch {
                         + offset as i64
                         + inst.len().to_const() as i64
                         + imm as i64;
-                    format!("{} 0x{:x}", inst.opcode(), dest)
+                    let dest_addr = dest as u64;
+                    
+                    // Try to resolve function name
+                    if let Some(function_name) = function_addresses.get(&dest_addr) {
+                        format!("{} {} # 0x{:x}", inst.opcode(), function_name, dest_addr)
+                    } else {
+                        format!("{} 0x{:x}", inst.opcode(), dest_addr)
+                    }
                 }
                 Operand::ImmediateI32 { imm } => {
                     let dest = base_address as i64
                         + offset as i64
                         + inst.len().to_const() as i64
                         + imm as i64;
-                    format!("{} 0x{:x}", inst.opcode(), dest)
+                    let dest_addr = dest as u64;
+                    
+                    // Try to resolve function name
+                    if let Some(function_name) = function_addresses.get(&dest_addr) {
+                        format!("{} {} # 0x{:x}", inst.opcode(), function_name, dest_addr)
+                    } else {
+                        format!("{} 0x{:x}", inst.opcode(), dest_addr)
+                    }
                 }
                 _ => inst.display_with(yaxpeax_x86::amd64::DisplayStyle::Intel).to_string(),
             }
@@ -294,7 +314,7 @@ impl InstructionDecoding for yaxpeax_x86::protected_mode::Arch {
         yaxpeax_x86::protected_mode::InstDecoder::default()
     }
 
-    fn inst_display(inst: &Self::Instruction, _base_address: u64, _offset: u32) -> String {
+    fn inst_display(inst: &Self::Instruction, _base_address: u64, _offset: u32, _function_addresses: &HashMap<u64, String>) -> String {
         inst.to_string()
     }
 }
@@ -307,7 +327,7 @@ impl InstructionDecoding for yaxpeax_arm::armv8::a64::ARMv8 {
         yaxpeax_arm::armv8::a64::InstDecoder::default()
     }
 
-    fn inst_display(inst: &Self::Instruction, _base_address: u64, _offset: u32) -> String {
+    fn inst_display(inst: &Self::Instruction, _base_address: u64, _offset: u32, _function_addresses: &HashMap<u64, String>) -> String {
         inst.to_string()
     }
 }
@@ -322,12 +342,12 @@ impl InstructionDecoding for yaxpeax_arm::armv7::ARMv7 {
         yaxpeax_arm::armv7::InstDecoder::default_thumb()
     }
 
-    fn inst_display(inst: &Self::Instruction, _base_address: u64, _offset: u32) -> String {
+    fn inst_display(inst: &Self::Instruction, _base_address: u64, _offset: u32, _function_addresses: &HashMap<u64, String>) -> String {
         inst.to_string()
     }
 }
 
-fn disassemble<'a, A: InstructionDecoding>(bytes: &'a [u8], base_address: u64) -> Result<Vec<InstructionInfo>, String>
+fn disassemble<'a, A: InstructionDecoding>(bytes: &'a [u8], base_address: u64, function_addresses: &HashMap<u64, String>) -> Result<Vec<InstructionInfo>, String>
 where
     u64: From<A::Address>,
     U8Reader<'a>: yaxpeax_arch::Reader<A::Address, A::Word>,
@@ -344,7 +364,7 @@ where
             Ok(inst) => {
                 instructions.push(InstructionInfo {
                     offset,
-                    instruction: A::inst_display(&inst, base_address, offset),
+                    instruction: A::inst_display(&inst, base_address, offset, function_addresses),
                 });
                 let after = u64::from(reader.total_offset()) as u32;
                 offset += after - before;
